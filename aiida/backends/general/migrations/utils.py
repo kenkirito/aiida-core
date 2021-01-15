@@ -15,6 +15,7 @@ import io
 import os
 import pathlib
 import re
+import shutil
 import typing
 
 import numpy
@@ -103,6 +104,64 @@ class NoopRepositoryBackend(AbstractRepositoryBackend):
         raise NotImplementedError()
 
 
+def perform_repository_migration_available_space_check(filepath_repository, safety_factor=1.5):
+    """Estimate the size of the file repository and check whether enough free space is available for migration.
+
+    If the estimated size of the repository exceeds the remaining free space on the same file system, the migration is
+    aborted. If the free space is smaller than `safety_factor * size_repo` a warning is printed saying that the
+    migration may fail due to a lack of space, but it is continued.
+    """
+    from aiida.cmdline.utils import echo
+
+    size_free = shutil.disk_usage(filepath_repository).free
+
+    # To determine the size of the repository, we could just compute the size of the entire folder, but this will be
+    # way too slow for big repositories. In those cases, we should just take shard `00/00` and multiply it with 256^2
+    # which should approximate the size of the entire repository, given that the UUIDs of the nodes should be more or
+    # less homogeneously distributed for big repositories. On the flipside, we cannot assume that `00/00` will exist,
+    # because for smaller repostories, there may not have been a node created with a UUID starting with `0000`. In this
+    # case, we cannot even assume that the shards that do exist have a homogeneously distributed size, so estimating the
+    # total size by computing a few shards and extrapolating is not safe and can severely over- or underestimate the
+    # size of the repo. Therefore, in this case, we simply directly compute the size of the entire repo.
+    all_shards = True
+
+    if len(list(filepath_repository.iterdir())) < 256:
+        # Not all 256 top level shards are present
+        all_shards = False
+    elif any(len(list(p.iterdir())) < 256 for p in filepath_repository.iterdir()):
+        # At least one of the top level shards contains less than 256 shards
+        all_shards = False
+
+    if all_shards:
+        # Even though all shards should be there, we only counted the subfolders, it could be that `00/00` actually
+        # still doesn't exist. This would mean a user messed with the repository but it is still within the realm of
+        # possibilities. So instead, we simply get the first subfolder of each level.
+        first_level = [s for s in filepath_repository.iterdir() if s.is_dir()][0]
+        filepath_shard = [s for s in first_level.iterdir() if s.is_dir()][0]
+        size_shard = sum(file.stat().st_size for file in pathlib.Path(filepath_shard).rglob('*'))
+        size_repo = size_shard * 256**2
+    else:
+        size_repo = sum(file.stat().st_size for file in pathlib.Path(filepath_repository).rglob('*'))
+
+    def f(n):
+        import math
+        p = int(math.log10(n) / 3)
+        return f'{n / 1000.0 ** p:.1f}' + ('', 'kB', 'MB', 'GB', 'TB', 'PB')[p]
+
+    if size_repo >= size_free * safety_factor:
+        echo.echo_warning(
+            f'the size of the repository {f(size_repo)} is very similar to the available free space {f(size_free)}.'
+            'The migration will now continue, but it is possible that it will fail as the repository will essentially '
+            'be duplicated during the migration, and so it may run out of disk space. If that happens, you should make '
+            'sure that more free space is available before restarting the migration.'
+        )
+    elif size_repo >= size_free:
+        echo.echo_critical(
+            f'the size of the repository {f(size_repo)} is larger than the available free space {f(size_free)}.'
+            'Aborting the migration since it would fail. Please create more free space and rerun the migration'
+        )
+
+
 def migrate_legacy_repository(node_count, shard=None):
     """Migrate the legacy file repository to the new disk object store and return mapping of repository metadata.
 
@@ -132,6 +191,8 @@ def migrate_legacy_repository(node_count, shard=None):
     filepath = pathlib.Path(profile.repository_path) / 'container'
     basepath = pathlib.Path(profile.repository_path) / 'repository' / 'node'
     container = Container(filepath)
+
+    perform_repository_migration_available_space_check(basepath)
 
     if not basepath.is_dir():
         # If the database is empty, this is a new profile and so it is normal the repo folder doesn't exist. We simply
